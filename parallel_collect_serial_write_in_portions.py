@@ -2,12 +2,12 @@
 # Each processor is responsible for the same number of files, filesPerProc = 10200/numProcs
 # To write out one variable, for filesPerProc/numFilesInMem times, repeat:
 #  - each processor loads in the variable from the next chunk of files, numFilesInMem, it is responsible for and reshapes it into a flattenedlength-by-8 submatrix to be written into the final matrix
-#  - iterating over the flattenedlength rows of these submatrices, extract several rows at a time, writeRowChunkSize, and send those to one of the writer processes in a round robin fashion
+#  - iterating over the flattenedlength rows of these submatrices, extract rowTransferChunk rows at a time, writeRowChunkSize, and send those to one of the writer processes in a round robin fashion
 #  - each writer process writes out to an independent file
 #
 # Note, each process will need about 2GB per file, so plan to have numFilesInMem * 5GB at least per processor (since you need more for reshaping, and miscellany)
 #
-# Assumptions: numProcs evenly divides 10200, numFilesInMem evenly divides filesPerProc, and numWriters evenly divides flattenedlength
+# Assumptions: numProcs evenly divides 10200, numFilesInMem evenly divides filesPerProc, and numWriters evenly divides flattenedlength/rowTransferChunk
 #
 # Optimizations:
 # - turn off fill at allocation in hdf5
@@ -16,7 +16,7 @@
 # - set the buffer size
 #
 # to debug, guesstimate speed, and test for correctness,
-# with 1500 files, 10 files per process, 5 files in mem at a time, use
+# with 50 files, 10 files per process, 5 files in mem at a time, use
 # salloc -N 30 -p debug -t 30 --qos=premium
 # module load h5py-parallel mpi4py netcdf4-python
 # srun -c 6 -n 150 -u python-mpi -u ./fname.py T
@@ -52,7 +52,7 @@ procslist = np.arange(numProcs)
 
 # MIGHT BE SMARTER TO SET MANUALLY
 #numWriters = numProcs
-numWriters = 216 # 72 * 3
+numWriters = numProcs
 
 def status(message, ranks=procslist):
     if rank in ranks:
@@ -69,12 +69,13 @@ datapath = "/global/cscratch1/sd/gittens/large-climate-dataset/data"
 filelist = [fname for fname in listdir(datapath) if fname.endswith(".nc")]
 
 # FOR DEBUGGING: REMOVE THIS ON FINAL RUN!
-REDUCEDNUMFILES = 510
+REDUCEDNUMFILES = 50
 filelist = [filelist[idx] for idx in np.arange(REDUCEDNUMFILES)]
 
 numFiles = len(filelist)
 filesPerProc = numFiles/numProcs
-numFilesInMem = 1 
+numFilesInMem = 5
+rowTransferChunk = 1024
 numLoadStages = filesPerProc/numFilesInMem
 
 numtimeslices = 8 # each variable comes in 8 time slices, and one time slice becomes one column
@@ -88,6 +89,7 @@ numlongs = 1152
 flattenedlength = numlevels*numlats*numlongs
 numRows = flattenedlength*numvars
 numCols = len(filelist)*numtimeslices
+numRowChunksToTransfer = numRows/rowTransferChunk
 
 littlePartitionSize = numRows/numWriters;
 bigPartitionSize = littlePartitionSize + 1;
@@ -99,8 +101,13 @@ if rank < numBigPartitions:
 else:
     myRowsPerOutputFile = littlePartitionSize
 
+# this should never be violated b/c of our load balanced assumptions
+assert(myRowsPerOutputFile == littlePartitionSize), "error"
+
 assert (numFiles % numProcs == 0), "The number of files is not evenly divisible by the number of processes"
 assert (filesPerProc % numFilesInMem == 0), "The number of files in memory on each process doesn't evenly divide the number of files the process is responsible for"
+assert (numRows % numRowChunksToTransfer == 0), "The number of rows is not divisible by the size of the chunks of rows being transferred" 
+assert (numRowChunksToTransfer % numWriters == 0), "The number of row chunks to be transferred is not divisible by the number of writer processes"
 
 report("Starting %d processes" % numProcs)
 report("Found %d input files" % len(filelist))
@@ -148,13 +155,17 @@ reportbarrier("Finished creating file and dataset")
 localcolumncount = numFilesInMem*numtimeslices
 rawvar = np.empty((numtimeslices, numlevels, numlats, numlongs), dtype=np.float64)
 curvals = np.empty((flattenedlength, localcolumncount), dtype=np.float64)
+chunktotransfer = np.empty((rowTransferChunk*localcolumncount,), dtype=np.float64)
 if rank in np.arange(numWriters):
-    collectedrowchunk = np.ascontiguousarray(np.empty((numProcs*localcolumncount,), dtype=np.float64))
+    collectedchunk = np.ascontiguousarray(np.empty((numProcs*localcolumncount*rowTransferChunk,), \
+            dtype=np.float64))
+    chunktowrite = np.ascontiguousarray(np.empty((rowTransferChunk, numProcs*localcolumncount), \
+            dtype=np.float64))
 else:
-    collectedrowchunk = None
+    collectedchunk = None
 
 fhoffset = 0
-curoutputrow = 0
+currowoffset = 0
 for (varidx,curvar) in enumerate(varnames): 
     reportbarrier("Writing variable %d/%d: %s" % (varidx + 1, numvars, curvar))
 
@@ -162,29 +173,54 @@ for (varidx,curvar) in enumerate(varnames):
     for colchunkidx in np.arange(filesPerProc/numFilesInMem):
         report("Loading column chunk %d/%d for this variable" % (colchunkidx + 1, filesPerProc/numFilesInMem))
 
+        # fill out the current chunk of columns for this process: 
+        # a flattenedlength by numFilesInMem*numtimeslices matrix
         for fhidxOffset in np.arange(numFilesInMem):
             rawvar[:] = myHandles[fhoffset + fhidxOffset][curvar][:]
             startcol = fhidxOffset*numtimeslices
             endcol = (fhidxOffset+1)*numtimeslices
             curvals[:, startcol:endcol] = \
                     np.reshape(rawvar, (flattenedlength, numtimeslices)) # uses C ordering
-        fhoffset = fhoffset + 8
+        fhoffset = fhoffset + numFilesInMem
 
-        reportbarrier("Finished loading column chunk %d/%d for this variable" % (colchunkidx + 1, filesPerProc/numFilesInMem))
+        reportbarrier("Finished loading column chunk %d/%d for this variable" % \
+                (colchunkidx + 1, filesPerProc/numFilesInMem))
         report("Gathering and writing this chunk of columns to file")
 
-        for rowidx in np.arange(flattenedlength):
-            MPI.COMM_WORLD.Gather(curvals[rowidx, :], collectedrowchunk, root = (rowidx % numWriters))
-            if rank == (rowidx % numWriters) :
+        for rowchunkidx in np.arange(numRowChunksToTransfer):
+            # collect rowTransferChunk rows (by numFilesInMem*numtimeslices columns) from each process
+            # flatten, and gather at the appropriate writer
+            startrow = rowchunkidx * rowTransferChunk
+            endrow = (rowchunkidx + 1) * rowTransferChunk
+            chunktotransfer[:] = curvals[startrow:endrow, :].flatten()
+            MPI.COMM_WORLD.Gather(chunktotransfer, collectedchunk, root = (rowchunkidx % numWriters))
+
+            if rank == (rowchunkidx % numWriters) :
+                # reshape the collected chunk to the chunk to be written out, of size
+                # rowTransferChunk by numProcs*numFilesInMem*numtimeslices
+                for processnum in np.arange(numProcs):
+                    startcol = processnum*localcolumncount
+                    endcol = (processnum+1)*localcolumncount
+                    startidx = processnum*(localcolumncount * rowTransferChunk)
+                    endidx = (processnum + 1)*(localcolumncount *rowTransferChunk)
+                    chunktowrite[:, startcol:endcol] = np.reshape(collectedchunk[startidx:endidx], \
+                            (rowTransferChunk, localcolumncount))
+
+                # write the chunk out
                 startcol = colchunkidx * (localcolumncount * numProcs)
                 endcol = (colchunkidx + 1) * (localcolumncount * numProcs)
-                rows[curoutputrow, startcol:endcol] = collectedrowchunk
-                if (curoutputrow % 1000) == 0:
-                    status("Wrote row %d/%d of column chunk %d/%d to output file %d/%d" % \
-                            (curoutputrow + 1, myRowsPerOutputFile, colchunkidx + 1, filesPerProc/numFilesInMem, rank + 1, numWriters))
-                curoutputrow = curoutputrow + 1
+                rows[currowoffset:(currowoffset + rowTransferChunk), startcol:endcol] = chunktowrite
+                currowoffset = currowoffset + rowTransferChunk
 
-for fh in enumerate(myHandles):
+                if (currowoffset/rowTransferChunk % 10) == 0:
+                        fout.flush()
+                        status("Wrote row chunk %d/%d of column chunk %d/%d to output file %d/%d" % \
+                                (rowchunkidx + 1, numRowChunksToTransfer, \
+                                colchunkidx + 1, filesPerProc/numFilesInMem, \
+                                rank + 1, numWriters))
+
+reportbarrier("Cleaning up")
+for fh in myHandles:
     fh.close()
 if rank in np.arange(numWriters):
     fout.close()
