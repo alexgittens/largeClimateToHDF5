@@ -84,10 +84,11 @@ numCols = len(filelist)*numtimeslices
 report("Creating file and dataset")
 
 foutname = "superstrided/atmosphere.hdf5"
-Ask for alignment with the stripe size (use lfs getstripe on target directory to determine)
+#Ask for alignment with the stripe size (use lfs getstripe on target directory to determine)
 propfaid = h5py.h5p.create(h5py.h5p.FILE_ACCESS)
 propfaid.set_fapl_mpio(MPI.COMM_WORLD, mpi_info)
 propfaid.set_alignment(1024*1024*1024, 1024*1024)
+propfaid.set_sieve_buf_size(1024*1024)
 fid = h5py.h5f.create(join(datapath, foutname), flags=h5py.h5f.ACC_TRUNC, fapl=propfaid)
 fout = h5py.File(fid)
 #fout = h5py.File(join(datapath, foutname), "w", driver="mpio", comm=MPI.COMM_WORLD)
@@ -149,12 +150,24 @@ for (varidx,curvar) in enumerate(varnames):
 
             dxpl = h5py.h5p.create(h5py.h5p.DATASET_XFER)
             dxpl.set_dxpl_mpio(h5py.h5fd.MPIO_COLLECTIVE) 
-            slab_shape = (flattenedlength, numtimeslices)
-            slab_offset = (varidx*flattenedlength, myoffset)
-            memory_space = h5py.h5s.create_simple(slab_shape)
-            file_space = rows.id.get_space()
-            file_space.select_hyperslab(slab_offset, slab_shape)
-            rows.id.write(memory_space, file_space, flatdata, dxpl = dxpl)
+            
+            numrowchunks = 120 # TODO: this should evenly divide flattenedlength
+            rowchunksize = flattenedlength/numrowchunks
+            rowchunkoffset = 0
+            while rowchunkoffset < rowchunksize*numrowchunks:
+                status("Writing a chunk within this chunk")
+                slab_offset = (varidx*flattenedlength + rowchunkoffset, myoffset)
+                slab_shape = (rowchunksize, numtimeslices)
+                memory_space = h5py.h5s.create_simple(slab_shape)
+                file_space = rows.id.get_space()
+                file_space.select_hyperslab(slab_offset, slab_shape)
+
+                rows.id.write(memory_space, file_space, 
+                        flatdata[rowchunkoffset*numtimeslices:((rowchunkoffset+1)*numtimeslices)], 
+                        dxpl = dxpl)
+                fout.id.flush()
+
+                rowchunkoffset = rowchunkoffset + numrowchunks
 
             #with rows.collective:
             #    rows[varidx*flattenedlength:(varidx+1)*flattenedlength, myoffset:(myoffset + numtimeslices)] = reshapedrawvar
