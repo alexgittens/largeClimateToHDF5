@@ -149,6 +149,7 @@ localcolumncount = numFilesInMem*numtimeslices
 rawvar = np.empty((numtimeslices, numlevels, numlats, numlongs), dtype=np.float64)
 curvals = np.empty((flattenedlength, localcolumncount), dtype=np.float64)
 chunktotransfer = np.empty((rowTransferChunk*localcolumncount,), dtype=np.float64)
+
 if rank in np.arange(numWriters):
     collectedchunk = np.ascontiguousarray(np.empty((numProcs*localcolumncount*rowTransferChunk,), \
             dtype=np.float64))
