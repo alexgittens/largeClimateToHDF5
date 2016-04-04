@@ -1,34 +1,22 @@
-# Algorithm:
-# Each processor is responsible for the same number of files, filesPerProc = 10200/numProcs
-# To write out one variable, for filesPerProc/numFilesInMem times, repeat:
-#  - each processor loads in the variable from the next chunk of files, numFilesInMem, it is responsible for and reshapes it into a flattenedlength-by-8 submatrix to be written into the final matrix
-#  - iterating over the flattenedlength rows of these submatrices, extract rowTransferChunk rows at a time, writeRowChunkSize, and send those to one of the writer processes in a round robin fashion
-#  - each writer process writes out to an independent file
+# This shoud be exactly the same as the code run for production of the final dataset, just with
+# parameters set to run on a smaller dataset for validation that we can map the output back to the input
 #
-# Note, each process will need about 2GB per file, so plan to have numFilesInMem * 5GB at least per processor (since you need more for reshaping, and miscellany)
+# 50 files 
+# 10 files/process
+# so need 5 processes
 #
-# Assumptions: numProcs evenly divides 10200, numFilesInMem evenly divides filesPerProc, and numWriters evenly divides flattenedlength/rowTransferChunk
+# use 5 files in memory at a time
+# assume 4 GB/file => 20 GB/process => can fix 6 processes/node => 1 node suffices
 #
-# Optimizations:
-# - turn off fill at allocation in hdf5
-# - use an output directory that has 72 OSTs
-# - turn on alignment with striping (use output from lfs getstripe to set alignment)
-# - set the buffer size
+# use 5 writers
+# write 1024 row chunks at a time
+# => should write out in 5184 chunks of columns
 #
-# will do conversion one variable at a time
-# to run in production: 10200 files, 20 files/process, 2 files in memory at a time, 4GB/file estimated => 34 nodes w/ 510 processes, 2 cores per process
-# REMEMBER to set numFilesInMem = 2, rowTransferChunk = 1024, numWriters = 180
-# looks like 22.5 GB/min (450 Gb written in a 20min run)
-# salloc -N 34 -p regular -t 30 --qos=premium
-# module load h5py-parallel mpi4py netcdf4-python
-# srun -c 2 -n 510 -u python-mpi -u ./fname.py V
-#
-# 10200 files, 10 files/process, 2 files in memory at a time, 4 GB/file estimated => 68 nodes w/ 1020 processes, 2 core per process
-# set numFilesInMem = 2, rowTransferChunk = 1024, numWriters = 180
-# need an estimate of the time!
-# salloc -N 68 -p debug -t 30 --qos=premium
-# srun -c 2 -n 1020 -u python-mpi -u ./fname.py V
-
+# to run:
+# salloc -N 1 -t 30 -p debug --qos=premium
+# bash
+# module load netcdf4-python h5py python mpi4py
+# srun -c 6 -n 5 -u python-mpi -u ./generate_test_set.py T
 
 from mpi4py import MPI
 from netCDF4 import Dataset
@@ -46,10 +34,7 @@ numProcs = MPI.COMM_WORLD.Get_size()
 
 procslist = np.arange(numProcs)
 
-# MIGHT BE SMARTER TO SET MANUALLY
-#numWriters = numProcs
-numWriters = numProcs
-numWriters = 180
+numWriters = 5
 
 def status(message, ranks=procslist):
     if rank in ranks:
