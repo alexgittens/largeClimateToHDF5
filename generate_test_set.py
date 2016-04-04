@@ -51,12 +51,12 @@ datapath = "/global/cscratch1/sd/gittens/large-climate-dataset/data"
 filelist = [fname for fname in listdir(datapath) if fname.endswith(".nc")]
 
 # FOR DEBUGGING: REMOVE THIS ON FINAL RUN!
-#REDUCEDNUMFILES = 50
-#filelist = [filelist[idx] for idx in np.arange(REDUCEDNUMFILES)]
+REDUCEDNUMFILES = 50
+filelist = [filelist[idx] for idx in np.arange(REDUCEDNUMFILES)]
 
 numFiles = len(filelist)
 filesPerProc = numFiles/numProcs
-numFilesInMem = 2
+numFilesInMem = 5
 rowTransferChunk = 1024
 numLoadStages = filesPerProc/numFilesInMem
 

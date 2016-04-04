@@ -81,6 +81,6 @@ def test_triplet(triplet):
 
     return (rawvar, convertedvar)
 
-(rawvar, convertedvar) = test_triplet(sampletriplets[0])
+#(rawvar, convertedvar) = test_triplet(sampletriplets[0])
 
 
