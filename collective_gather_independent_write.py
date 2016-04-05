@@ -2,7 +2,7 @@
 # salloc -N 10 --reservation=m1523 -t 30
 # bash
 # module load h5py-parallel mpi4py netcdf4-python
-# srun -c 6 -n 50 -u python-mpi -u ./fname.py
+# srun -c 6 -n 50 -u python-mpi -u ./fname.py variablename
 #
 # Optimizations:
 # - turn off fill at allocation in hdf5
@@ -46,11 +46,13 @@ def chunkidxToWriter(chunkidx):
 
 datapath = "/global/cscratch1/sd/gittens/large-climate-dataset/data"
 filelist = [fname for fname in listdir(datapath) if fname.endswith(".nc")]
+varname = (sys.argv[1])
 
 # FOR TESTING ONLY: REMOVE WHEN RUNNING FINAL JOB
-filelist = [fname for fname in filelist[:1000]]
+#filelist = [fname for fname in filelist[:1000]]
 
 report("Using %d processes" % numProcs)
+report("Writing variable %s" % varname)
 report("Found %d input files, starting to open" % len(filelist))
 
 assert( len(filelist) % numProcs == 0)
@@ -64,9 +66,11 @@ for (idx, fname) in enumerate(myfiles):
 
 reportbarrier("Finished opening all files")
 
-varnames = ["T", "U", "V", "Q", "Z3"]
+#varnames = ["T", "U", "V", "Q", "Z3"]
 #varnames = ["T"]
+varnames = [varname]
 numvars = len(varnames)
+numvars = 1
 numtimeslices = 8
 numlevels = 30
 numlats = 768
@@ -79,7 +83,7 @@ rowChunkSize = numlats*numlongs/numlevdivs
 
 numWriters = numlevdivs 
 coloutname = "superstrided/colfilenames" 
-foutname = "superstrided/atmosphere"
+foutname = "superstrided/" + varname
 
 assert ((numlats * numlongs) % numlevdivs == 0)
 
@@ -121,7 +125,7 @@ if rank in map(chunkidxToWriter, np.arange(numWriters)):
     collectedchunk = np.ascontiguousarray(np.empty((numCols*rowChunkSize,), \
             dtype=np.float32))
     chunktowrite = np.ascontiguousarray(np.empty((rowChunkSize, numCols), \
-            dtype=np.float64))
+            dtype=np.float32))
 else:
     collectedchunk = None
 
