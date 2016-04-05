@@ -2,6 +2,7 @@
 # salloc -N 10 --reservation=m1523 -t 30
 # bash
 # module load h5py-parallel mpi4py netcdf4-python
+# module load python h5py mpi4py netcdf4-python
 # srun -c 6 -n 50 -u python-mpi -u ./fname.py
 #
 # Optimizations:
@@ -42,13 +43,13 @@ def reportbarrier(message):
 
 # maps the chunkidx (0...numlevdivs=numWriters) to the rank of the process that should write it out
 def chunkidxToWriter(chunkidx):
-   return chunkidx*numProcessesPerNode # should always write from different nodes
-
+   return chunkidx*numProcessesPerNode%numProcs # should always write from different nodes
+jialinpath =  "/global/cscratch1/sd/jialin/climate/large"
 datapath = "/global/cscratch1/sd/gittens/large-climate-dataset/data"
 filelist = [fname for fname in listdir(datapath) if fname.endswith(".nc")]
 
 # FOR TESTING ONLY: REMOVE WHEN RUNNING FINAL JOB
-filelist = [fname for fname in filelist[:1000]]
+#filelist = [fname for fname in filelist[:1000]]
 
 report("Using %d processes" % numProcs)
 report("Found %d input files, starting to open" % len(filelist))
@@ -64,22 +65,24 @@ for (idx, fname) in enumerate(myfiles):
 
 reportbarrier("Finished opening all files")
 
-varnames = ["T", "U", "V", "Q", "Z3"]
+#varnames = ["T", "U", "V", "Q", "Z3"]
+varnames = ["T"]
 #varnames = ["T"]
 numvars = len(varnames)
 numtimeslices = 8
-numlevels = 30
+numlevels = 15
+#numlevels = 30
 numlats = 768
 numlongs = 1152
-numlevdivs = 6
+numlevdivs = 64
 flattenedlength = numlevels*numlats*numlongs
 numRows = flattenedlength*numvars
 numCols = len(filelist)*numtimeslices
 rowChunkSize = numlats*numlongs/numlevdivs
 
 numWriters = numlevdivs 
-coloutname = "superstrided/colfilenames" 
-foutname = "superstrided/atmosphere"
+coloutname = "colfilenames" 
+foutname = "atmosphere"
 
 assert ((numlats * numlongs) % numlevdivs == 0)
 
@@ -100,7 +103,7 @@ for chunkidx in np.arange(numWriters):
         propfaid = h5py.h5p.create(h5py.h5p.FILE_ACCESS)
         propfaid.set_alignment(1024, 1024*1024)
         #propfaid.set_sieve_buf_size(numCols*8*20) # be able to store 20 rows worth of data
-        fid = h5py.h5f.create(join(datapath, foutname + str(chunkidx) + ".hdf5"), flags=h5py.h5f.ACC_TRUNC, fapl=propfaid)
+        fid = h5py.h5f.create(join(jialinpath, foutname + str(chunkidx) + ".hdf5"), flags=h5py.h5f.ACC_TRUNC, fapl=propfaid)
         fout = h5py.File(fid)
 
         # Don't use filling 
@@ -121,10 +124,11 @@ if rank in map(chunkidxToWriter, np.arange(numWriters)):
     collectedchunk = np.ascontiguousarray(np.empty((numCols*rowChunkSize,), \
             dtype=np.float32))
     chunktowrite = np.ascontiguousarray(np.empty((rowChunkSize, numCols), \
-            dtype=np.float64))
+            dtype=np.float32))
 else:
     collectedchunk = None
-
+curlevdatatemp=np.ascontiguousarray(np.zeros((numlats*numlongs*numtimeslices), \
+            dtype=np.float32))
 currowoffset = 0
 for (varidx,curvar) in enumerate(varnames): 
     reportbarrier("Writing variable %d/%d: %s" % (varidx + 1, numvars, curvar))
@@ -134,11 +138,16 @@ for (varidx,curvar) in enumerate(varnames):
         # load the data for this level from my files
         reportbarrier("Loading data for level %d/%d" % (curlev + 1, numlevels))
         for (fhidx, fh) in enumerate(myhandles):
-            if fh[curvar].shape[0] < numtimeslices:
-                status("File %s has only %d timesteps for variable %s, simply repeating the first timestep" % (myfiles[fhidx], myfiles[fhidx].shape[0], curvar))
+            if fh[curvar].shape[0] < numtimeslices and fh[curvar].shape[0] >0:
+                status("File %s has only %d timesteps for variable %s, simply repeating the first timestep" % (myfiles[fhidx], fh[curvar].shape[0], curvar))
                 for idx in np.arange(numtimeslices):
-                    curlevdata[:, idx] = fh[curvar][1, curlev, ...].reshape(numlats*numlongs, 1)
-            else:
+                    curlevdatatemp[numlats*numlongs*idx:numlats*numlongs*(idx+1)] = fh[curvar][0, curlev, ...].flatten()
+		curlevdata[:, fhidx*numtimeslices: (fhidx + 1)*numtimeslices]=curlevdatatemp.reshape(numlats*numlongs, numtimeslices)
+            elif fh[curvar].shape[0] ==0:
+		status("File %s has only %d timesteps for variable %s, simply repeating the first timestep" % (myfiles[fhidx], fh[curvar].shape[0], curvar))
+		curlevdata[:, fhidx*numtimeslices: (fhidx + 1)*numtimeslices] = \
+			curlevdatatemp.reshape(numlats*numlongs, numtimeslices)
+	    else:
                 curlevdata[:, fhidx*numtimeslices: (fhidx + 1)*numtimeslices] = \
                     fh[curvar][:, curlev, ...].reshape(numlats*numlongs, numtimeslices)
         reportbarrier("Done loading data for this level")
@@ -157,7 +166,7 @@ for (varidx,curvar) in enumerate(varnames):
             if rank == chunkidxToWriter(chunkidx):
                 # reshape the collected chunk to the chunk to be written out, of size
                 # rowChunkSize by numCols
-
+		print "current rank writer is:%d"%rank
                 for processnum in np.arange(numProcs):
                     startcol = processnum*localcolumncount
                     endcol = (processnum+1)*localcolumncount
@@ -165,7 +174,7 @@ for (varidx,curvar) in enumerate(varnames):
                     endidx = (processnum + 1)*(localcolumncount *rowChunkSize)
                     chunktowrite[:, startcol:endcol] = np.reshape(collectedchunk[startidx:endidx], \
                             (rowChunkSize, localcolumncount))
-
+		#chunktowrite=np.reshape(collectedchunk,(rowChunkSize,numCols))
                 rows[currowoffset : (currowoffset + rowChunkSize)] = chunktowrite
                 currowoffset = currowoffset + rowChunkSize
         reportbarrier("Done writing")
